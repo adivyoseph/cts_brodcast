@@ -18,35 +18,24 @@
 
 //My defines
 #define PRIV_CORES_MAX          32   //24 for workstation
+#define SAMPLES_MAX             512
 
 #ifndef CACHELINE_SIZE
 #define CACHELINE_SIZE 64
 #endif
   
+void *th_funcRx(void *p_arg);
+void *th_funcTx(void *p_arg);
 
-void *th_func(void *p_arg);
 
-
-#define MSG_CMD_MASTER_START        10       //arg master context id
-#define MSG_CMD_SYNC                1
-#define MSG_CMD_FOLLOW_UP           2
-#define MSG_CMD_DELAY_REQ           3
-#define MSG_CMD_DELAY_RESP          4
-#define MSG_CMD_MASTER_DONE         11
 
 
 typedef struct msg_s {
     unsigned long long int uid __attribute__ ((aligned(CACHELINE_SIZE)));
-    int msg_cmd;
-    int arg;
-    unsigned long long int t1;
-    unsigned long long int t2;
-    unsigned long long int t3;
-    unsigned long long int t4;
-    int data[4];
+    int data[1];
 } msg_t ;
 
-msg_t g_msgs[PRIV_CORES_MAX];       //global cache aligned message areas
+msg_t g_msgs;       //global cache aligned message areas
 
 
 typedef struct context_s {
@@ -57,53 +46,43 @@ typedef struct context_s {
     int setaffinity;                    //if set core to bind to
     char *name;
     int ready;
+    int done;
     //results
-    unsigned long long int t1 __attribute__ ((aligned(CACHELINE_SIZE)));
-    unsigned long long int t2;
-    unsigned long long int t3;
-    unsigned long long int t4;
-    long long int offset;
+
+    int statsIndex;
+    unsigned long long int uidSamples[SAMPLES_MAX][2];
 
 } context_t;
 context_t   contexts[PRIV_CORES_MAX + 1];
 
 //notes
 //context 0 main
-//context n thread and core n
+//context 1 tx threadTx
+//context 2 rx through (2 + i_threadsRx)
 
 int g_ncores = 24;          //Todo learn dynamically
-typedef struct core_stats_s {
-    unsigned long long int t1 ;
-    unsigned long long int t2;
-    unsigned long long int t3;
-    unsigned long long int t4;
-    unsigned long long int offset;
-}core_stats_t;
 
-typedef struct master_stats_s {
-    core_stats_t perCore[PRIV_CORES_MAX];
-}master_stats_t;
 
-master_stats_t master_stats[PRIV_CORES_MAX];
+//test config, avoids commandline args
+int i_threadsRx = 4;                //commandline -t x overrides
+int i_threadstx = 1;                //fixed
+
 
 void usage(){
-    printf("-h     help\n\n");
+    printf("-h     help\n-t     rx thread count 1-23\n-s        tx core afinity\n-c      rx cores x,y,z[,a,b,...]\n");
 }
 
 
 int main(int argc, char **argv){	
     int opt;
-    int i,j,k,l, state, run;
+    int i,j,k,l;
     context_t *this = &contexts[0];
     cpu_set_t my_set;        /* Define your cpu_set bit mask. */
     char cwork[64];
     char work[64];
-    unsigned long long int uidOld = 0;
-    unsigned long long int tsc = 0;
+    unsigned long long int first, secnd, work0, work1;
     context_t *p_cont;
-
-    msg_t *p_sendMsg;
-    msg_t *p_recvMsg;
+    int scatter[1024];
 
     this->name = "Main";
     this->tpid = gettid();
@@ -112,11 +91,21 @@ int main(int argc, char **argv){
     //init context objects
     for (i = 0; i < PRIV_CORES_MAX; i++) {
         contexts[i].id = i;
-        contexts[i].setaffinity = i;
-        contexts[i].p_msg = &g_msgs[i];
+        contexts[i].setaffinity = -1;
+        contexts[i].p_msg = &g_msgs;
+        contexts[i].ready = 0;
+        contexts[i].done = 0;
     }
 
-    while((opt = getopt(argc, argv, "h")) != -1) 
+    //defaults
+    contexts[0].setaffinity = 0;    //main
+    contexts[1].setaffinity = 1;    //tx
+    contexts[2].setaffinity = 2;    //rx_1
+    contexts[3].setaffinity = 3;    //rx_2
+    contexts[4].setaffinity = 4;    //rx_3
+    contexts[5].setaffinity = 5;    //rx_4
+
+    while((opt = getopt(argc, argv, "ht:m:s:c:")) != -1) 
     { 
         switch(opt) 
         { 
@@ -125,22 +114,104 @@ int main(int argc, char **argv){
             return 0;
             break;
 
-         default:
+        case 't':  
+                i = atoi(optarg);
+                if (i < 1 && i > (PRIV_CORES_MAX - 2)) {
+                    printf("t range 1 - %d error %d\n", (PRIV_CORES_MAX - 2), i);
+                    return 1;
+                }
+                i_threadsRx = i;
+                printf("threadsRx: %s\n", optarg); 
+                break; 
+
+        case 'm':  
+                //Todo add duplicate check
+                i = atoi(optarg);
+                if (i > PRIV_CORES_MAX) {
+                    printf("s range 0 - %d error %d\n", (PRIV_CORES_MAX), i);
+                    return 1;
+                }
+                printf("pin TxThread 0 to %s\n", optarg);
+                contexts[0].setaffinity = i;
+                break;
+
+        case 's':  
+                //Todo add duplicate check
+                i = atoi(optarg);
+                if (i > PRIV_CORES_MAX) {
+                    printf("s range 0 - %d error %d\n", (PRIV_CORES_MAX), i);
+                    return 1;
+                }
+                printf("pin TxThread 1 to %s\n", optarg);
+                contexts[1].setaffinity = i;
+                break;
+
+        case 'c':  
+                //Todo add duplicate check
+                printf("coresRx: %s \n", optarg); 
+                //coma seperated list 
+                strcpy(cwork, optarg);
+                i = 0;
+                j = 0;
+                k = 0;
+                while (cwork[i] != 0) {
+                    if (cwork[i] == ' ') {
+                        i++;
+                        continue;
+                    }
+                    while ((cwork[i] >= '0') && (cwork[i] <= '9')) {
+                        work[j] = cwork[i];
+                        work[j+1] = '\0';
+                        i++;
+                        j++;
+                    }
+                    if(cwork[i] == '\0'){
+                        l = atoi(work);
+                        if (l > PRIV_CORES_MAX) {
+                            printf("s range 0 - %d error %d\n", (PRIV_CORES_MAX), l);
+                            return 1;
+                        }
+                        printf("pin RxThread %d to %s\n", k, work);
+                        contexts[k + 2].setaffinity = l;
+                    }
+                    if (cwork[i] == ',') {
+                        l = atoi(work);
+                        if (l > PRIV_CORES_MAX) {
+                            printf("s range 0 - %d error %d\n", (PRIV_CORES_MAX), l);
+                            return 1;
+                        }
+                        printf("pin RxThread %d to %s\n", k, work);
+                        contexts[k + 2].setaffinity = l;
+                        k++;
+                        j = 0;
+                        i++;
+                    }
+                }
+                break; 
+
+  
+        default:
             usage();
             return 0;
                 break;
+
         } 
     } 
     printf("\n");
 
     //set main thread afinity
     CPU_ZERO(&my_set); 
-    CPU_SET(this->setaffinity, &my_set);
-    sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
+     if (this->setaffinity >= 0) {
+         CPU_SET(this->setaffinity, &my_set);
+         sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
+     }
 
      //create a thread for each core
-     for (i = 1;  i < g_ncores; i++) {
-         pthread_create(&contexts[i].thread_id, NULL, th_func, (void *) &contexts[i]);
+     //TxThread
+     pthread_create(&contexts[1].thread_id, NULL, th_funcTx, (void *) &contexts[1]);
+     //RxThreads
+     for (i = 2;  i <= i_threadsRx + 2; i++) {
+         pthread_create(&contexts[i].thread_id, NULL, th_funcRx, (void *) &contexts[i]);
      }
 
      //wait for then to all come up
@@ -153,78 +224,128 @@ int main(int argc, char **argv){
      } while (j < g_ncores);
      printf("all cores ready %d\n", j);
 
-     //sleep(1);
 
-     i = 1; //master core
-     state = 0;  //iteration state
-     p_recvMsg = this->p_msg;
-     run = 1;
-     while (run) {
-             switch (state) {
-             case 0:    //start a new master
-                 p_sendMsg = &g_msgs[i];
-                 p_sendMsg->msg_cmd = MSG_CMD_MASTER_START;
-                 p_sendMsg->uid = __rdtsc();
-                 state++;
-                 break;
-             case 1:    //start sent wait for done
-                 while (p_recvMsg->uid == uidOld) {
-                 }
-                 tsc = __rdtsc();
-                 uidOld = p_recvMsg->uid;
-                 if (p_recvMsg->msg_cmd == MSG_CMD_MASTER_DONE) {
-                     //printf("main recieved master_done\n");
-                     //get stats before next run
-                     for (j = 1; j < g_ncores; j++) {
-                         if (j == i) {
-                             master_stats[i].perCore[j].offset = 0;
-                             master_stats[i].perCore[j].t1 = 0;
-                             master_stats[i].perCore[j].t2 = 0;
-                             master_stats[i].perCore[j].t3 = 0;
-                             master_stats[i].perCore[j].t4 = 0;
-                         }
-                         else {
-                             master_stats[i].perCore[j].offset = contexts[j].offset;
-                             master_stats[i].perCore[j].t1 = contexts[j].t1;
-                             master_stats[i].perCore[j].t2 = contexts[j].t1;
-                             master_stats[i].perCore[j].t3 = contexts[j].t1;
-                             master_stats[i].perCore[j].t4 = contexts[j].t1;
-                         }
-                     }
-                     i++;
-                     if (i >= g_ncores) {
-                         run = 0;
-                     }
-                     state = 0;
-                 }
-                 break;
-
-             default:
-                 break;
-
+     //wait for threadRx done
+     do {
+         for (i = 2, j = 2;  i <= i_threadsRx + 2; i++) {
+             if (contexts[i].ready) {
+                 j++;
              }
-         }
-     printf("          :   ");
-     for (i = 1;  i < g_ncores; i++) {
-         printf("%02d     ", i);
-     }
-     printf("\n");
-     for (i = 1;  i < g_ncores; i++) {
-         printf("Master %02d : ", i);
+         }         
+     } while (j < i_threadsRx + 3);
+     printf("Rx cores done %d\n", j);
 
-         for (j = 1; j < g_ncores; j++) {
-             if (j == i) {
-                 printf("XXXXXX ");
+     //check that each rx detected the values
+     for (j = 0; j < 512; j++) {
+         first = contexts[ 2].uidSamples[j][0];
+         printf("%04d %lld  ", j, first);
+         for (i = 2; i < i_threadsRx + 2; i++) {
+             if (first == contexts[i].uidSamples[j][0]) {
+                 printf(". ");
              }
-             else {
-                 printf("%06d ",  (int) master_stats[i].perCore[j].offset);
+             else{
+                 printf("X %lld", contexts[i].uidSamples[j][0]);
              }
          }
          printf("\n");
      }
 
+     //tx jitter
+     printf("tx jitter\n");
+     i = 0;
+     first = 10000;
+     for (j = 0; j < 512; j++) {
+         scatter[j] = 0;
+     }
+     printf("center %lld\n", first);
+     for (j = 0, i = 0; j < 512; j++) {
+         work1 =  contexts[ 1].uidSamples[j][0] - contexts[ 1].uidSamples[i][0];
+         if (work1 == 0) {
+             i = j;
+             continue;
+         }
+         if (work1 == first) {
+             scatter[256] ++;
+         }
+         else if (work1 < first) {
+             k = first - work1;
+             if (k < 256) {
+                 scatter[work1 - (first - 256)] ++;
+             }
+             else{
+                 scatter[0]++;
+             }
+         }
+         else {
+             //work1 > work
+             k = work1 -first;
+             if (k >256) {
+                 scatter[511]++;
+             }
+             else{
+                 scatter[256 +k]++;
+             }
+         }
+         i = j;
+     }
+     for (i = 0; i < 512; i++) {
+         printf("%03d %d\n", i, scatter[i]);
+     }
+
+
 	return 0;
 }
+
+
+/**
+ * @brief 
+ * 
+ * @author martin (1/27/23)
+ * 
+ * @param p_arg 
+ * 
+ * @return void* 
+ */
+void *th_funcTx(void *p_arg){
+    context_t *this = (context_t *) p_arg;
+    cpu_set_t my_set;        /* Define your cpu_set bit mask. */
+    int i_destCnt = i_threadsRx;
+    int i = 0;
+    msg_t *p_msg;
+    unsigned long long int work;
+
+    this->name = "txFunc";
+    this->tpid = gettid();
+    printf("Thread %s_%d PID %d %d\n", this->name,
+                                       this->id, 
+                                       this->tpid, 
+                                       gettid());
+
+    CPU_ZERO(&my_set); 
+    if (this->setaffinity >= 0) {
+        CPU_SET(this->setaffinity, &my_set);
+        sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
+    }
+    p_msg = this->p_msg;;
+
+    i = 0;
+    work = __rdtsc() + 10000;
+    while (1){
+
+        //sleep(0.001);
+        while (work > __rdtsc()) {
+        }
+        work = work + 10000;
+        p_msg->uid = __rdtsc();
+        this->uidSamples[i][0] = p_msg->uid;
+        i++;
+        if (i >= SAMPLES_MAX) {
+            while (1) {
+            }
+        }
+    }
+}
+
 
 
 
@@ -237,135 +358,37 @@ int main(int argc, char **argv){
  * 
  * @return void* 
  */
-void *th_func(void *p_arg){
+void *th_funcRx(void *p_arg){
     context_t *this = (context_t *) p_arg;
     cpu_set_t my_set;        /* Define your cpu_set bit mask. */
-    int i = 0;
-    msg_t *p_msg;
-    msg_t *p_sendMsg;
-    unsigned long long int uidOld;
-    unsigned long long int tsc;
-    int state = 0;
-    long long int a, b;
+    msg_t *p_msg = this->p_msg;
+    unsigned long long int uidOld = 0;
+    unsigned long long int tsc = 0;
 
-    this->name = "func";
+    this->name = "rxFunc";
     this->tpid = gettid();
-    /*
-    printf("Thread %s_%02d PID %d %d\n", this->name,
+    printf("Thread %s_%d PID %d %d\n", this->name,
                                        this->id, 
                                        this->tpid, 
                                        gettid());
-*/
-    CPU_ZERO(&my_set); 
-    CPU_SET(this->setaffinity, &my_set);
-    sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
 
-    p_msg = this->p_msg;;
-    this->ready = 1;
+    CPU_ZERO(&my_set); 
+    if (this->setaffinity >= 0) {
+        CPU_SET(this->setaffinity, &my_set);
+        sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
+    }
 
     while (1){
-
         while (p_msg->uid == uidOld) {
         }
         tsc = __rdtsc();
         uidOld = p_msg->uid;
-        //printf("thd %02d cmd %d \n", this->id, p_msg->msg_cmd);
-        if (state == 0) {
-            //waiting for anything
-            switch (p_msg->msg_cmd) {
-            case MSG_CMD_MASTER_START:
-                //master
-                    for (i = 1; i < g_ncores; i++) {
-                        if (i == this->id) {
-                            continue;
-                        }
-                        state = 10;
-                        //slave id
-                        p_sendMsg = contexts[i].p_msg;
-                        do {
-                            switch (state) {
-                            case 10:  //send sync
-                                p_sendMsg->arg = this->id;
-                                p_sendMsg->msg_cmd = MSG_CMD_SYNC;
-                                p_sendMsg->t1 = __rdtsc();
-                                p_sendMsg->uid = p_sendMsg->t1;
-                                //this->t1 = p_sendMsg->t1;
-                                //printf("thd %02d send  MSG_CMD_SYNC to %d \n", this->id, i);
-                                state++;
-                                break;
-                            case 11:  //waiting for delay_req
-                                while (p_msg->uid == uidOld) {
-                                }
-                                tsc = __rdtsc();
-                                uidOld = p_msg->uid;
-                                if (p_msg->msg_cmd == MSG_CMD_DELAY_REQ) {
-                                     //printf("thd %02d cmd %d \n", this->id, p_msg->msg_cmd);
-                                    //this->t4 = tsc;
-                                    p_sendMsg->t4 = tsc;
-                                    p_sendMsg->msg_cmd = MSG_CMD_DELAY_RESP;
-                                    p_sendMsg->uid = __rdtsc();
-                                    //printf("thd %02d send  MSG_CMD_DELAY_RESP to %d \n", this->id, i);
-                                    state = 0;
-                                }
-                                break;
-                              default:
-                                break;
-                            }
-                        }while (state > 10);
-                    }
-                //printf("thd %02d master done \n", this->id);
-                state = 0;
-                p_sendMsg = contexts[0].p_msg;
-                p_sendMsg->msg_cmd = MSG_CMD_MASTER_DONE;
-                p_sendMsg->uid = __rdtsc();
-                break;
-            case MSG_CMD_SYNC:
-                //slave
-                state = 1;
-                //printf("thd %02d p_msg->arg %d \n", this->id, p_msg->arg);
-                p_sendMsg = contexts[p_msg->arg].p_msg;
-                do {
-                    switch (state) {
-                    case 1: //recieved sync
-
-                        p_msg->t2 = tsc;
-                        p_sendMsg->msg_cmd = MSG_CMD_DELAY_REQ;
-                        p_msg->t3 = __rdtsc();
-
-                        p_sendMsg->uid = p_msg->t3 ;
-                        state ++;
-                        break;
-                    case 2: //waiting for delay_resp
-                        while (p_msg->uid == uidOld) {
-                        }
-                        tsc = __rdtsc();
-                        uidOld = p_msg->uid;
-                        if (p_msg->msg_cmd == MSG_CMD_DELAY_RESP) {
-                            //we have everything to calculate offset
-                            this->t1 = p_msg->t1;
-                            this->t2 = p_msg->t2;
-                            this->t3 = p_msg->t3;
-                            this->t4 = p_msg->t4;
-                            a = (int)(this->t1 - this->t2);
-                            b = (int)(this->t3 - this->t4);
-                            this->offset = (long long int)(a-b)/2;
-                            state = 0;
-                        }
-                        break;
-                    default:
-                        break;
-
-                    }
-                } while (state > 0);
-
-
-
-
-                break;
-            default:
-                break;
-            }
+        if (this->statsIndex < SAMPLES_MAX) {
+        this->uidSamples[this->statsIndex][0] = uidOld;
+        this->uidSamples[this->statsIndex][1] = tsc;
+        this->statsIndex++;
         }
+
     }
 }
 
