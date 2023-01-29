@@ -18,7 +18,8 @@
 
 //My defines
 #define PRIV_CORES_MAX          32   //24 for workstation
-#define SAMPLES_MAX             512
+#define SAMPLES_MAX             1024
+#define TX_DELAY                9000
 
 #ifndef CACHELINE_SIZE
 #define CACHELINE_SIZE 64
@@ -45,8 +46,8 @@ typedef struct context_s {
     int tpid;                           //os thread process id
     int setaffinity;                    //if set core to bind to
     char *name;
-    int ready;
-    int done;
+    volatile int ready;
+    volatile int done;
     //results
 
     int statsIndex;
@@ -72,6 +73,7 @@ void usage(){
     printf("-h     help\n-t     rx thread count 1-23\n-s        tx core afinity\n-c      rx cores x,y,z[,a,b,...]\n");
 }
 
+int scatter[SAMPLES_MAX];
 
 int main(int argc, char **argv){	
     int opt;
@@ -82,7 +84,6 @@ int main(int argc, char **argv){
     char work[64];
     unsigned long long int first, secnd, work0, work1;
     context_t *p_cont;
-    int scatter[1024];
 
     this->name = "Main";
     this->tpid = gettid();
@@ -210,18 +211,20 @@ int main(int argc, char **argv){
      //TxThread
      pthread_create(&contexts[1].thread_id, NULL, th_funcTx, (void *) &contexts[1]);
      //RxThreads
-     for (i = 2;  i <= i_threadsRx + 2; i++) {
+     for (i = 2;  i < i_threadsRx + 3; i++) {
          pthread_create(&contexts[i].thread_id, NULL, th_funcRx, (void *) &contexts[i]);
      }
 
      //wait for then to all come up
      do {
-         for (i = 1, j = 1;  i < g_ncores; i++) {
+         for (i = 1, j = 0;  i < i_threadsRx + 3; i++) {
              if (contexts[i].ready) {
                  j++;
              }
          }         
-     } while (j < g_ncores);
+         sleep(1);
+         printf("ready wait loop j = %d \n", j);
+     } while (j < i_threadsRx + 1);
      printf("all cores ready %d\n", j);
 
 
@@ -236,7 +239,7 @@ int main(int argc, char **argv){
      printf("Rx cores done %d\n", j);
 
      //check that each rx detected the values
-     for (j = 0; j < 512; j++) {
+     for (j = 0; j < SAMPLES_MAX; j++) {
          first = contexts[ 2].uidSamples[j][0];
          printf("%04d %lld  ", j, first);
          for (i = 2; i < i_threadsRx + 2; i++) {
@@ -250,47 +253,49 @@ int main(int argc, char **argv){
          printf("\n");
      }
 
-     //tx jitter
-     printf("tx jitter\n");
-     i = 0;
-     first = 10000;
-     for (j = 0; j < 512; j++) {
-         scatter[j] = 0;
-     }
-     printf("center %lld\n", first);
-     for (j = 0, i = 0; j < 512; j++) {
+
+
+     printf("tx diffs\n");
+     for (j = 0, i = 0; j < SAMPLES_MAX; j++) {
          work1 =  contexts[ 1].uidSamples[j][0] - contexts[ 1].uidSamples[i][0];
          if (work1 == 0) {
-             i = j;
              continue;
          }
-         if (work1 == first) {
-             scatter[256] ++;
+         printf("%04d %lld\n", j, work1);
+         i = j;
+     }
+     //tx jitter
+     printf("tx jitter\n");
+     first = TX_DELAY - (SAMPLES_MAX/2);
+     for (j = 0; j < SAMPLES_MAX; j++) {
+         scatter[j] = 0;
+     }
+     printf("center %d\n", TX_DELAY);
+     l = 5;
+     for (j = 0, i = 0; j < SAMPLES_MAX; j++) {
+         work1 =  contexts[ 1].uidSamples[j][0] - contexts[ 1].uidSamples[i][0];
+         if (work1 == 0) {
+             continue;
+         }
+         if (work1 > (first + (SAMPLES_MAX) -1)) {
+             scatter[(SAMPLES_MAX/l) -1] ++;
          }
          else if (work1 < first) {
-             k = first - work1;
-             if (k < 256) {
-                 scatter[work1 - (first - 256)] ++;
-             }
-             else{
                  scatter[0]++;
-             }
          }
          else {
              //work1 > work
              k = work1 -first;
-             if (k >256) {
-                 scatter[511]++;
-             }
-             else{
-                 scatter[256 +k]++;
-             }
+             k = k/l;
+             scatter[k]++;
          }
          i = j;
      }
-     for (i = 0; i < 512; i++) {
-         printf("%03d %d\n", i, scatter[i]);
+     for (i = 0; i < SAMPLES_MAX/l; i++) {
+         printf("%03d %d\n", i*l + (int)first, scatter[i]);
      }
+
+
 
 
 	return 0;
@@ -313,6 +318,8 @@ void *th_funcTx(void *p_arg){
     int i = 0;
     msg_t *p_msg;
     unsigned long long int work;
+    unsigned long long int work1;
+    unsigned long long int prev;
 
     this->name = "txFunc";
     this->tpid = gettid();
@@ -327,18 +334,29 @@ void *th_funcTx(void *p_arg){
         sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
     }
     p_msg = this->p_msg;;
+    this->ready = 1;
 
     i = 0;
-    work = __rdtsc() + 10000;
+    prev = __rdtsc();
+    work = prev + (unsigned long long int)TX_DELAY;
     while (1){
 
         //sleep(0.001);
-        while (work > __rdtsc()) {
+        do {
+                    work1 =  __rdtsc();
+        }while (work > work1);
+        if ((work1 - prev) > (TX_DELAY + 100)) {
+            work = work1 + (unsigned long long int)TX_DELAY;
+            prev = work1;
         }
-        work = work + 10000;
-        p_msg->uid = __rdtsc();
-        this->uidSamples[i][0] = p_msg->uid;
-        i++;
+        else {
+            p_msg->uid = work1;
+            work = work1 + (unsigned long long int)TX_DELAY;
+            prev = work1;
+            this->uidSamples[i][0] = work1;
+            i++;
+        }
+
         if (i >= SAMPLES_MAX) {
             while (1) {
             }
@@ -378,6 +396,8 @@ void *th_funcRx(void *p_arg){
         sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
     }
 
+    this->ready = 1;
+
     while (1){
         while (p_msg->uid == uidOld) {
         }
@@ -387,6 +407,9 @@ void *th_funcRx(void *p_arg){
         this->uidSamples[this->statsIndex][0] = uidOld;
         this->uidSamples[this->statsIndex][1] = tsc;
         this->statsIndex++;
+        }
+        else {
+                this->done = 1;
         }
 
     }
